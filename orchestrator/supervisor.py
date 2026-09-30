@@ -1,19 +1,27 @@
 """
-ISDO Lab C6 - LangGraph Orchestrator (Supervisor)
+ISDO Lab C6/C7 - LangGraph Orchestrator (Supervisor)
 Routes a ticket through Triage -> Resolution -> SLA -> [HITL] -> Communication
 using a LangGraph StateGraph with one shared TicketState.
 
+Lab C7: the HITL gate fires for three reasons -
+  1. P1 ticket with SLA CRITICAL or BREACHED  (escalation needs approval)
+  2. Resolution confidence LOW                (no clear KB fix, any priority)
+  3. Access grant request                     (security-sensitive, any priority)
+
 Run from the project root:   python orchestrator/supervisor.py
 Needs: Labs C1-C5 done (agents/*.py, chroma_db), ANTHROPIC_API_KEY in .env,
-       ServiceNow mock running (.\\start_shims.ps1 or python mcp_server/snow_shim.py).
+       both mocks running (.\\start_shims.ps1): ServiceNow for INC tickets,
+       Jira for REQ tickets.
 """
 
 import operator
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+import requests
 from langgraph.graph import END, START, StateGraph
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +34,8 @@ from agents import resolution_agent, sla_agent, triage_agent  # noqa: E402
 
 client = anthropic.Anthropic()
 MODEL = triage_agent.MODEL  # same ISDO_MODEL setting as the agents
+JIRA_URL = os.environ.get("JIRA_URL", "http://localhost:5002")
+ACCESS_GRANT_TEAM = "Security-Ops"  # who actions an approved access grant
 
 # -- SHARED STATE -------------------------------------------------------------
 
@@ -39,6 +49,7 @@ class TicketState(TypedDict, total=False):
     category: str
     priority: str
     sla_due: str
+    request_type: str          # Jira request type for REQ- tickets, e.g. "Access Grant"
     # triage node
     triage_category: str
     triage_priority: str
@@ -57,6 +68,8 @@ class TicketState(TypedDict, total=False):
     escalation_team: str
     escalated: bool
     hitl_required: bool
+    hitl_reason: str           # why the gate fired (one or more triggers, " | "-separated)
+    hitl_triggers: list        # machine-readable: "sla_escalation", "low_confidence", "access_grant"
     # hitl node
     hitl_approved: bool
     # communication node
@@ -75,6 +88,44 @@ def audit(agent: str, action: str, detail: str) -> list:
 
 def header(title: str):
     print(f"\n▶ {title}")
+
+
+def is_jira(ticket_number: str) -> bool:
+    return ticket_number.upper().startswith("REQ-")
+
+
+def lookup_request_type(ticket_number: str) -> str:
+    """For REQ- tickets with no request_type given, ask the Jira mock (Lab C2)."""
+    try:
+        r = requests.get(f"{JIRA_URL}/rest/api/2/issue/{ticket_number}", timeout=5)
+        if r.ok:
+            return r.json()["fields"]["issuetype"]["name"] or ""
+    except requests.RequestException:
+        print(f"  (Jira mock not reachable at {JIRA_URL} - request_type unknown)")
+    return ""
+
+
+def update_record(ticket_number, action, team=None, note=None, new_state=None) -> dict:
+    """Update the system of record: ServiceNow for INC tickets, Jira for REQ tickets."""
+    if not is_jira(ticket_number):
+        return sla_agent.update_ticket(ticket_number, action, team, note, new_state)
+
+    fields = {"status": {"name": "Escalated" if action == "escalate" else new_state or "Open"}}
+    if team:
+        fields["assignee"] = {"displayName": team}
+    if action == "add_note":
+        fields = {"comment": note or ""}
+    try:
+        r = requests.put(f"{JIRA_URL}/rest/api/2/issue/{ticket_number}",
+                         json={"fields": fields}, timeout=5)
+    except requests.RequestException:
+        print(f"  [Jira Mock] NOT REACHABLE at {JIRA_URL} - start jira_shim.py")
+        return {"success": False, "message": "Jira mock not reachable; update not made"}
+    if not r.ok:
+        print(f"  [Jira Mock] FAILED ({r.status_code}): {r.text[:100]}")
+        return {"success": False, "message": f"Jira returned {r.status_code}"}
+    print(f"  [Jira Mock] {action.upper()} {ticket_number}: {fields}")
+    return {"success": True}
 
 # -- NODES ----------------------------------------------------------------------
 
@@ -113,31 +164,69 @@ def resolution_node(state: TicketState) -> dict:
 
 
 def sla_node(state: TicketState) -> dict:
+    """Check the SLA, then decide whether the HITL gate is needed (Lab C7: 3 triggers)."""
     header("SLA AGENT — checking deadline")
-    priority = state["triage_priority"]
-    s = sla_agent.get_sla_status(state["ticket_number"], state["sla_due"], priority)
+    number, priority = state["ticket_number"], state["triage_priority"]
+    triggers, reasons, entries = [], [], []
+    out = {"escalated": False}
+
+    # -- Trigger 3: access grant (checked first - it changes what "resolution" means)
+    request_type = state.get("request_type") or (lookup_request_type(number) if is_jira(number) else "")
+    categories = {state.get("category"), state.get("triage_category")}
+    access_grant = request_type == "Access Grant" and "Access" in categories
+    out["request_type"] = request_type
+    if access_grant:
+        triggers.append("access_grant")
+        reasons.append(f"ACCESS GRANT — '{state['short_description']}' requires security approval")
+        # An access grant is approved or refused, never "fixed" from a KB article
+        if state.get("auto_resolve"):
+            out["auto_resolve"] = False
+            entries += audit("SLAAgent", "override_auto_resolve",
+                             "Access grant - KB auto-resolve disabled, approval needed")
+
+    # -- SLA check (Lab C5 rules)
+    s = sla_agent.get_sla_status(number, state["sla_due"], priority)
     if "error" in s:
-        return {"sla_breach_risk": "UNKNOWN", "escalation_required": False,
-                "hitl_required": True,  # can't judge the SLA -> let a human look
-                "audit_log": audit("SLAAgent", "get_sla_status", s["error"])}
+        out.update(sla_breach_risk="UNKNOWN", escalation_required=False)
+        triggers.append("sla_unknown")
+        reasons.append(f"SLA UNKNOWN — {s['error']}")
+        entries += audit("SLAAgent", "get_sla_status", s["error"])
+        escalate = False
+    else:
+        auto = state.get("auto_resolve", False) and not access_grant
+        escalate = s["requires_escalation"] and not auto  # auto-resolved tickets aren't escalated
+        print(f"  SLA Risk: {s['breach_risk']} | Minutes remaining: {s['minutes_remaining']} "
+              f"| Target: {s['sla_target_minutes']} min ({priority})")
+        out.update(sla_breach_risk=s["breach_risk"], sla_minutes_remaining=s["minutes_remaining"],
+                   escalation_required=escalate)
+        entries += audit("SLAAgent", "get_sla_status",
+                         f"{s['breach_risk']}, {s['minutes_remaining']} min left, "
+                         f"escalation_required={escalate}")
 
     team = sla_agent.ESCALATION_TEAMS.get(state["triage_category"], sla_agent.DEFAULT_TEAM)
-    # An auto-resolved ticket is being fixed now, so it is not escalated.
-    escalate = s["requires_escalation"] and not state.get("auto_resolve", False)
-    hitl = escalate and priority in sla_agent.HITL_PRIORITIES   # P1 CRITICAL/BREACHED
-    print(f"  SLA Risk: {s['breach_risk']} | Minutes remaining: {s['minutes_remaining']} "
-          f"| Target: {s['sla_target_minutes']} min ({priority})")
+    out["escalation_team"] = team
 
-    out = {"sla_breach_risk": s["breach_risk"], "sla_minutes_remaining": s["minutes_remaining"],
-           "escalation_required": escalate, "escalation_team": team,
-           "hitl_required": hitl, "escalated": False}
-    entries = audit("SLAAgent", "get_sla_status",
-                    f"{s['breach_risk']}, {s['minutes_remaining']} min left, "
-                    f"escalation_required={escalate}, hitl_required={hitl}")
+    # -- Trigger 1: P1 CRITICAL/BREACHED escalation
+    if escalate and priority in sla_agent.HITL_PRIORITIES:
+        triggers.append("sla_escalation")
+        reasons.append(f"P1 SLA {s['breach_risk']} — escalation to {team} "
+                       f"({s['minutes_remaining']} min left)")
 
-    if escalate and not hitl:  # e.g. P2 CRITICAL/BREACHED: escalate without a human
-        result = sla_agent.update_ticket(state["ticket_number"], "escalate", team,
-                                         note=f"Auto-escalated: SLA {s['breach_risk']}")
+    # -- Trigger 2: LOW resolution confidence (any priority)
+    if state.get("confidence") == "LOW":
+        triggers.append("low_confidence")
+        reasons.append(f"LOW KB CONFIDENCE ({state.get('kb_score', 0):.0%}) — no clear fix, "
+                       f"route to {team} for manual resolution")
+
+    hitl = bool(triggers)
+    out.update(hitl_required=hitl, hitl_triggers=triggers, hitl_reason=" | ".join(reasons))
+    if hitl:
+        entries += audit("SLAAgent", "hitl_check", f"HITL required: {out['hitl_reason']}")
+
+    # P2 CRITICAL/BREACHED with no other trigger: escalate without a human (Lab C5 rule)
+    if escalate and not hitl:
+        result = update_record(number, "escalate", team,
+                               note=f"Auto-escalated: SLA {s['breach_risk']}")
         out["escalated"] = result["success"]
         entries += audit("SLAAgent", "update_ticket",
                          f"Auto-escalated to {team}" if result["success"]
@@ -146,60 +235,95 @@ def sla_node(state: TicketState) -> dict:
     return out
 
 
+def ask_human(state: TicketState) -> bool:
+    """Show why the gate fired and wait for y/n. Anything else (or no keyboard) = reject."""
+    print("  " + "WARNING " * 8)
+    print(f"  Ticket:  {state['ticket_number']} | Priority: {state.get('triage_priority')}")
+    for reason in state.get("hitl_reason", "").split(" | "):
+        print(f"  Reason:  {reason}")
+    print("  " + "WARNING " * 8)
+    try:
+        return input("  Approve action? [y/n]: ").strip().lower() == "y"
+    except EOFError:
+        return False
+
+
 def hitl_node(state: TicketState) -> dict:
     header("HITL GATE — human approval required")
+    number, triggers = state["ticket_number"], state.get("hitl_triggers", [])
     team = state.get("escalation_team", sla_agent.DEFAULT_TEAM)
-    approved = sla_agent.hitl_approve(
-        state["ticket_number"], "Escalate ticket",
-        f"Escalate to {team} (SLA {state.get('sla_breach_risk')}, "
-        f"{state.get('sla_minutes_remaining')} min left)")
+    approved = ask_human(state)
+    decision = "APPROVED" if approved else "REJECTED"
+    print(f"  Decision: {decision}")
     out = {"hitl_approved": approved}
-    entries = audit("HITLGate", "approval", "APPROVED by operator" if approved
-                    else "REJECTED by operator - escalation cancelled")
-    if approved:
-        result = sla_agent.update_ticket(state["ticket_number"], "escalate", team,
-                                         note="Escalation approved by human operator")
+    entries = audit("HITLGate", "approval_decision",
+                    f"{decision} by operator — {state.get('hitl_reason', '')}")
+
+    if not approved:
+        result = update_record(number, "add_note",
+                               note=f"HITL rejected: {state.get('hitl_reason', '')}")
+        entries += audit("HITLGate", "update_ticket", "Pending approval noted"
+                         if result["success"] else f"Note failed: {result['message']}")
+    elif "access_grant" in triggers:
+        result = update_record(number, "update_state", ACCESS_GRANT_TEAM, new_state="Approved")
+        entries += audit("HITLGate", "update_ticket",
+                         f"Access grant approved -> {ACCESS_GRANT_TEAM} to provision"
+                         if result["success"] else f"Update failed: {result['message']}")
+    elif "sla_escalation" in triggers or "low_confidence" in triggers:
+        why = "SLA escalation" if "sla_escalation" in triggers else "manual resolution (LOW KB match)"
+        result = update_record(number, "escalate", team, note=f"Approved by operator: {why}")
         out["escalated"] = result["success"]
         entries += audit("SLAAgent", "update_ticket",
-                         f"Escalated to {team}" if result["success"]
+                         f"Escalated to {team} for {why}" if result["success"]
                          else f"Escalation to {team} failed: {result['message']}")
-    else:
-        print("  Escalation cancelled.")
     out["audit_log"] = entries
     return out
 
 
 COMM_PROMPT = """You are the ISDO Communication Agent for Zensar's IT Service Desk.
 Write a short, friendly status update (max 120 words) to the person who raised the
-ticket. Start with "Dear User," and mention the ticket number. Use only the facts
-given - never invent steps, names, times or promises. Do not include any personal
-data (names, emails, employee IDs). Plain text only, no markdown."""
+ticket. Start with "Dear User," (or "Dear Requester," for a service request) and
+mention the ticket number. Use only the facts given - never invent steps, names,
+times or promises. Do not include any personal data (names, emails, employee IDs).
+Plain text only, no markdown."""
 
 
 def communication_node(state: TicketState) -> dict:
     header("COMMUNICATION AGENT")
     number = state["ticket_number"]
     group = state.get("triage_assignment_group", "Service-Desk")
+    triggers = state.get("hitl_triggers", [])
+    sn = {"success": True}  # SLA/HITL nodes already updated the record where needed
 
-    if state.get("auto_resolve"):
+    if state.get("hitl_required") and not state.get("hitl_approved"):
+        status = "PENDING_APPROVAL"
+        facts = ("Outcome: the request needs further review and approval before we can act. "
+                 "It is on hold pending approval; we will update them as soon as a decision "
+                 "is made. Do not say it was rejected.")
+    elif "access_grant" in triggers:
+        status = "APPROVED"
+        facts = (f"Outcome: their access grant request has been approved. The "
+                 f"{ACCESS_GRANT_TEAM} team will now provision the access and confirm when done.")
+    elif state.get("auto_resolve"):
         status = "RESOLVED"
         facts = ("Outcome: self-service resolution from the knowledge base. Include these "
                  f"steps exactly:\n{state.get('resolution_text', '')}\n"
                  "Ask them to reply if the steps do not fix it.")
-        sn = sla_agent.update_ticket(number, "update_state", new_state="Resolved")
+        sn = update_record(number, "update_state", new_state="Resolved")
     elif state.get("escalated"):
         status = "ESCALATED"
-        who = "approved by the duty manager" if state.get("hitl_approved") else "automatically"
-        facts = (f"Outcome: escalated {who} to the {state.get('escalation_team')} team "
-                 "because of the service-level deadline. They are working on it urgently.")
-        sn = {"success": True}  # already updated in ServiceNow by the SLA/HITL node
+        if "low_confidence" in triggers:
+            facts = (f"Outcome: no standard fix was found, so a specialist in the "
+                     f"{state.get('escalation_team')} team will investigate and contact them.")
+        else:
+            who = "approved by the duty manager" if state.get("hitl_approved") else "automatically"
+            facts = (f"Outcome: escalated {who} to the {state.get('escalation_team')} team "
+                     "because of the service-level deadline. They are working on it urgently.")
     else:
         status = "ASSIGNED"
-        extra = (" Escalation was reviewed and declined for now."
-                 if state.get("hitl_required") and not state.get("hitl_approved") else "")
-        facts = f"Outcome: assigned to the {group} team, who will contact them.{extra}"
-        sn = sla_agent.update_ticket(number, "add_note",
-                                     note=f"Requester notified: ticket {status} to {group}")
+        facts = f"Outcome: assigned to the {group} team, who will contact them."
+        sn = update_record(number, "add_note",
+                           note=f"Requester notified: ticket {status} to {group}")
 
     response = client.messages.create(
         model=MODEL, max_tokens=2000, output_config={"effort": "low"}, system=COMM_PROMPT,
@@ -209,9 +333,10 @@ def communication_node(state: TicketState) -> dict:
 
     print(f"  USER MESSAGE:\n    " + message.replace("\n", "\n    "))
     print(f"\n  ✅ FINAL STATUS: {status}")
+    system = "Jira" if is_jira(number) else "ServiceNow"
     return {"user_message": message, "final_status": status,
             "audit_log": audit("CommunicationAgent", "draft_message",
-                               f"{status}; ServiceNow updated={sn['success']}")}
+                               f"{status}; {system} updated={sn['success']}")}
 
 # -- GRAPH ----------------------------------------------------------------------
 
@@ -257,6 +382,16 @@ if __name__ == "__main__":
                            "was reset. Error: authentication failed.",
             "category": "Network", "priority": "P2", "sla_due": "2024-01-15 14:00:00",
         },
+        # Lab C7 Step 3 - LOW-confidence trigger: swap this in for the VPN ticket above.
+        # Change BOTH short_description and description: if the VPN description stays,
+        # the KB search still matches the VPN article and confidence will not be LOW.
+        # {
+        #     "ticket_number": "INC0001001",
+        #     "short_description": "Cisco Webex not launching on MacBook M2 after Sonoma update",
+        #     "description": "Cisco Webex app crashes on launch on a MacBook M2 since the "
+        #                    "macOS Sonoma update. Reinstalling did not help.",
+        #     "category": "Software", "priority": "P3", "sla_due": "2024-01-15 14:00:00",
+        # },
         {   # P1 SAP -> Triage -> Resolution -> SLA -> HITL -> Communication (type 'y')
             # incidents.csv has 11:00 = exactly 50% of the 60-min P1 target (ON_TRACK,
             # no HITL). 10:40 makes it CRITICAL, as the lab intends (same as Lab C5).
@@ -265,6 +400,14 @@ if __name__ == "__main__":
             "description": "Multiple users in Finance unable to login to SAP. "
                            "Error code: DBCON_FAIL. Started 09:00 today.",
             "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00",
+        },
+        {   # Lab C7 Step 4 - access grant (REQ-1002 in requests.csv) -> HITL regardless
+            # of priority. request_type may be omitted: it is then read from the Jira mock.
+            "ticket_number": "REQ-1002",
+            "short_description": "VPN access for new contractor",
+            "description": "Contractor needs VPN access. Email: contractor@client.com",
+            "category": "Access", "priority": "P2", "sla_due": "2024-01-15 15:00:00",
+            "request_type": "Access Grant",
         },
     ]
 
@@ -282,10 +425,13 @@ if __name__ == "__main__":
     for s in results:
         path = " → ".join(e["agent"] for e in s["audit_log"]
                           if e["action"] in ("classify_ticket", "search_kb",
-                                             "get_sla_status", "approval", "draft_message"))
+                                             "get_sla_status", "approval_decision",
+                                             "draft_message"))
         print("\n" + "═" * 55)
         print(f"AUDIT LOG — {s['ticket_number']}  ({s['final_status']})")
+        if s.get("hitl_required"):
+            print(f"  HITL: {'APPROVED' if s.get('hitl_approved') else 'REJECTED'} — {s['hitl_reason']}")
         print("═" * 55)
         print(f"  Path: {path}")
         for e in s["audit_log"]:
-            print(f"  {e['timestamp']}  {e['agent']:<18} {e['action']:<16} {e['detail']}")
+            print(f"  {e['timestamp']}  {e['agent']:<18} {e['action']:<22} {e['detail']}")
