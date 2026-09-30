@@ -1,5 +1,5 @@
 """
-ISDO Lab C6/C7 - LangGraph Orchestrator (Supervisor)
+ISDO Lab C6/C7/C8 - LangGraph Orchestrator (Supervisor)
 Routes a ticket through Triage -> Resolution -> SLA -> [HITL] -> Communication
 using a LangGraph StateGraph with one shared TicketState.
 
@@ -8,10 +8,17 @@ Lab C7: the HITL gate fires for three reasons -
   2. Resolution confidence LOW                (no clear KB fix, any priority)
   3. Access grant request                     (security-sensitive, any priority)
 
+Lab C8: when the KB match is LOW, the Resolution node asks the Knowledge
+Specialist agent over A2A (POST /tasks, then GET /tasks/{id}). If it answers with
+MEDIUM/HIGH confidence the LOW trigger clears; if it is LOW too, or the A2A server
+is not running, the ticket falls back to the HITL gate.
+
 Run from the project root:   python orchestrator/supervisor.py
 Needs: Labs C1-C5 done (agents/*.py, chroma_db), ANTHROPIC_API_KEY in .env,
        both mocks running (.\\start_shims.ps1): ServiceNow for INC tickets,
-       Jira for REQ tickets.
+       Jira for REQ tickets. Optional (Lab C8): Knowledge Specialist on :8001
+       (python -m uvicorn a2a.knowledge_specialist:app --port 8001).
+Run one ticket only:  python orchestrator/supervisor.py INC0001009
 """
 
 import operator
@@ -36,6 +43,8 @@ client = anthropic.Anthropic()
 MODEL = triage_agent.MODEL  # same ISDO_MODEL setting as the agents
 JIRA_URL = os.environ.get("JIRA_URL", "http://localhost:5002")
 ACCESS_GRANT_TEAM = "Security-Ops"  # who actions an approved access grant
+A2A_URL = os.environ.get("A2A_URL", "http://localhost:8001")  # Knowledge Specialist (Lab C8)
+A2A_TIMEOUT = 120  # seconds - the specialist calls Claude before it answers
 
 # -- SHARED STATE -------------------------------------------------------------
 
@@ -61,6 +70,9 @@ class TicketState(TypedDict, total=False):
     resolution_text: str
     auto_resolve: bool
     confidence: str
+    a2a_used: bool             # Lab C8: Knowledge Specialist consulted over A2A
+    a2a_task_id: str
+    a2a_status: str            # "completed", "unavailable", "error: ..."
     # sla node
     sla_breach_risk: str
     sla_minutes_remaining: int
@@ -127,6 +139,35 @@ def update_record(ticket_number, action, team=None, note=None, new_state=None) -
     print(f"  [Jira Mock] {action.upper()} {ticket_number}: {fields}")
     return {"success": True}
 
+def call_knowledge_specialist(state: TicketState) -> dict:
+    """Lab C8 - A2A round-trip: submit a task, then fetch its result.
+    Returns the specialist's result dict, or {"error": ...} if it could not be reached."""
+    query = f"{state['short_description']}. {state['description']}"
+    context = (f"Category: {state.get('triage_category')}, "
+               f"Priority: {state.get('triage_priority')}")
+    try:
+        # 1) submit the task
+        r = requests.post(f"{A2A_URL}/tasks", timeout=A2A_TIMEOUT, json={
+            "query": query, "ticket_number": state["ticket_number"], "context": context})
+        r.raise_for_status()
+        task_id = r.json()["task_id"]
+        print(f"  -> A2A task submitted: {task_id} ({r.json().get('status')})")
+        # 2) fetch the result
+        r = requests.get(f"{A2A_URL}/tasks/{task_id}", timeout=A2A_TIMEOUT)
+        r.raise_for_status()
+        task = r.json()
+    except requests.ConnectionError:
+        return {"error": f"Knowledge Specialist not running at {A2A_URL}", "status": "unavailable"}
+    except requests.Timeout:
+        return {"error": f"Knowledge Specialist timed out after {A2A_TIMEOUT}s", "status": "error: timeout"}
+    except (requests.RequestException, KeyError, ValueError) as exc:
+        return {"error": f"A2A call failed: {exc}", "status": "error: bad response"}
+
+    if task.get("status") != "completed" or "result" not in task:
+        return {"error": f"A2A task {task_id} not completed ({task.get('status')})",
+                "status": f"error: {task.get('status')}"}
+    return {"task_id": task_id, "status": "completed", **task["result"]}
+
 # -- NODES ----------------------------------------------------------------------
 
 def triage_node(state: TicketState) -> dict:
@@ -155,12 +196,53 @@ def resolution_node(state: TicketState) -> dict:
                 "auto_resolve": False, "resolution_text": "",
                 "audit_log": audit("ResolutionAgent", "search_kb",
                                    "No resolution drafted - routed to a human")}
-    return {"kb_article": r["kb_article_used"], "kb_score": r["score"],
-            "confidence": r["confidence"], "auto_resolve": r["auto_resolve"],
-            "resolution_text": r["resolution_text"],
-            "audit_log": audit("ResolutionAgent", "search_kb",
-                               f"{r['kb_article_used']} {r['confidence']} ({r['score']:.0%}), "
-                               f"auto_resolve={r['auto_resolve']}")}
+    out = {"kb_article": r["kb_article_used"], "kb_score": r["score"],
+           "confidence": r["confidence"], "auto_resolve": r["auto_resolve"],
+           "resolution_text": r["resolution_text"], "a2a_used": False,
+           "audit_log": audit("ResolutionAgent", "search_kb",
+                              f"{r['kb_article_used']} {r['confidence']} ({r['score']:.0%}), "
+                              f"auto_resolve={r['auto_resolve']}")}
+    if r["confidence"] == "LOW":
+        out.update(a2a_fallback(state))
+        out["audit_log"] = out["audit_log"] + out.pop("a2a_audit")
+    return out
+
+
+def a2a_fallback(state: TicketState) -> dict:
+    """LOW KB match -> ask the Knowledge Specialist (A2A). Any failure keeps LOW,
+    so the SLA node sends the ticket to the HITL gate."""
+    header("A2A — calling Knowledge Specialist (LOW KB confidence)")
+    res = call_knowledge_specialist(state)
+    if "error" in res:
+        print(f"  !! {res['error']} - keeping LOW confidence (HITL fallback)")
+        return {"a2a_used": False, "a2a_status": res["status"],
+                "a2a_audit": audit("KnowledgeSpecialist", "a2a_call",
+                                   f"FAILED: {res['error']} - falling back to HITL")}
+
+    confidence = res.get("confidence", "LOW")
+    if res.get("escalate_to_l2"):
+        confidence = "LOW"  # the specialist itself says a human must take it
+    print(f"  -> A2A result: {res.get('best_match')}  {confidence} "
+          f"({res.get('confidence_score', 0):.0%})  escalate_to_l2={res.get('escalate_to_l2')}")
+
+    out = {"a2a_used": True, "a2a_task_id": res["task_id"], "a2a_status": "completed",
+           "confidence": confidence, "kb_score": res.get("confidence_score", 0.0),
+           "kb_article": f"{res.get('best_match')} (via A2A)",
+           # The specialist writes for an L2 engineer, so it is never sent to the
+           # requester as a self-service fix: auto_resolve stays False.
+           "auto_resolve": False}
+    entries = audit("KnowledgeSpecialist", "a2a_call",
+                    f"Task {res['task_id']}: {res.get('best_match')} {confidence} "
+                    f"({res.get('confidence_score', 0):.0%})")
+    if confidence != "LOW" and res.get("resolution"):
+        out["resolution_text"] = res["resolution"]
+        note = f"Knowledge Specialist (A2A task {res['task_id']}) suggests:\n{res['resolution']}"
+        result = update_record(state["ticket_number"], "add_note", note=note[:2000])
+        entries += audit("ResolutionAgent", "update_ticket",
+                         "A2A resolution added as work note for the engineer"
+                         if result["success"] else f"Note failed: {result['message']}")
+    out["a2a_audit"] = entries
+    return out
 
 
 def sla_node(state: TicketState) -> dict:
@@ -215,8 +297,11 @@ def sla_node(state: TicketState) -> dict:
     # -- Trigger 2: LOW resolution confidence (any priority)
     if state.get("confidence") == "LOW":
         triggers.append("low_confidence")
-        reasons.append(f"LOW KB CONFIDENCE ({state.get('kb_score', 0):.0%}) — no clear fix, "
-                       f"route to {team} for manual resolution")
+        a2a = state.get("a2a_status")
+        a2a_note = ("" if not a2a else " (Knowledge Specialist also LOW)" if a2a == "completed"
+                    else f" (Knowledge Specialist {a2a})")
+        reasons.append(f"LOW KB CONFIDENCE ({state.get('kb_score', 0):.0%}){a2a_note} — "
+                       f"no clear fix, route to {team} for manual resolution")
 
     hitl = bool(triggers)
     out.update(hitl_required=hitl, hitl_triggers=triggers, hitl_reason=" | ".join(reasons))
@@ -322,8 +407,13 @@ def communication_node(state: TicketState) -> dict:
     else:
         status = "ASSIGNED"
         facts = f"Outcome: assigned to the {group} team, who will contact them."
-        sn = update_record(number, "add_note",
-                           note=f"Requester notified: ticket {status} to {group}")
+        if state.get("a2a_used"):
+            facts += (" Our knowledge specialist has already prepared a suggested fix for "
+                      "the engineer, so they can start straight away.")
+            sn = {"success": True}  # keep the A2A work note (the mock stores one note)
+        else:
+            sn = update_record(number, "add_note",
+                               note=f"Requester notified: ticket {status} to {group}")
 
     response = client.messages.create(
         model=MODEL, max_tokens=2000, output_config={"effort": "low"}, system=COMM_PROMPT,
@@ -371,7 +461,8 @@ def process_ticket(app, ticket: dict) -> TicketState:
 # -- RUN ------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Model: {MODEL}   |   Simulated now: {sla_agent.NOW:%Y-%m-%d %H:%M}")
+    print(f"Model: {MODEL}   |   Simulated now: {sla_agent.NOW:%Y-%m-%d %H:%M}   |   "
+          f"A2A: {A2A_URL}")
     app = build_graph()
 
     test_tickets = [
@@ -382,16 +473,6 @@ if __name__ == "__main__":
                            "was reset. Error: authentication failed.",
             "category": "Network", "priority": "P2", "sla_due": "2024-01-15 14:00:00",
         },
-        # Lab C7 Step 3 - LOW-confidence trigger: swap this in for the VPN ticket above.
-        # Change BOTH short_description and description: if the VPN description stays,
-        # the KB search still matches the VPN article and confidence will not be LOW.
-        # {
-        #     "ticket_number": "INC0001001",
-        #     "short_description": "Cisco Webex not launching on MacBook M2 after Sonoma update",
-        #     "description": "Cisco Webex app crashes on launch on a MacBook M2 since the "
-        #                    "macOS Sonoma update. Reinstalling did not help.",
-        #     "category": "Software", "priority": "P3", "sla_due": "2024-01-15 14:00:00",
-        # },
         {   # P1 SAP -> Triage -> Resolution -> SLA -> HITL -> Communication (type 'y')
             # incidents.csv has 11:00 = exactly 50% of the 60-min P1 target (ON_TRACK,
             # no HITL). 10:40 makes it CRITICAL, as the lab intends (same as Lab C5).
@@ -409,7 +490,24 @@ if __name__ == "__main__":
             "category": "Access", "priority": "P2", "sla_due": "2024-01-15 15:00:00",
             "request_type": "Access Grant",
         },
+        {   # Lab C7 Step 3 / Lab C8 - LOW KB confidence: no KB article covers Webex.
+            # Resolution -> A2A Knowledge Specialist. If it is LOW too (or not running)
+            # -> HITL; if it answers MEDIUM/HIGH -> no LOW trigger, ASSIGNED with its fix.
+            # Uses INC0001009's record in the ServiceNow mock so updates have a target.
+            "ticket_number": "INC0001009",
+            "short_description": "Cisco Webex not launching on MacBook M2 after Sonoma update",
+            "description": "Cisco Webex app crashes on launch on a MacBook M2 since the "
+                           "macOS Sonoma update. Reinstalling did not help.",
+            "category": "Software", "priority": "P3", "sla_due": "2024-01-18 17:00:00",
+        },
     ]
+
+    # Optional: run only some tickets, e.g.  python orchestrator/supervisor.py INC0001009
+    wanted = {a.upper() for a in sys.argv[1:]}
+    if wanted:
+        test_tickets = [t for t in test_tickets if t["ticket_number"].upper() in wanted]
+        if not test_tickets:
+            sys.exit(f"No test ticket matches {', '.join(sorted(wanted))}")
 
     results = []
     try:
@@ -425,7 +523,7 @@ if __name__ == "__main__":
     for s in results:
         path = " → ".join(e["agent"] for e in s["audit_log"]
                           if e["action"] in ("classify_ticket", "search_kb",
-                                             "get_sla_status", "approval_decision",
+                                             "a2a_call", "get_sla_status", "approval_decision",
                                              "draft_message"))
         print("\n" + "═" * 55)
         print(f"AUDIT LOG — {s['ticket_number']}  ({s['final_status']})")
